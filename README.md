@@ -1,8 +1,11 @@
 # Ghidra CtrlP Script
 
+> This fork provides plugin support for latest Ghidra API (Ghidra 12.0.4 at the moment, PyGhidra support required)
+
 Ghidra is great, but very mouse-driven by default. Some modern editors (like VS Code) provide a quick file switcher/command
 pallete, commonly bound to Ctrl+P file switcher and command pallete. I decided,
 that it would be nice to have this in ghidra.
+
 
 With this script you can just press Ctrl+P and do ~~anything~~ a lot.
 

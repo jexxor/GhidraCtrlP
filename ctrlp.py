@@ -5,6 +5,8 @@
 # @toolbar
 
 import re
+import base64
+import binascii
 from ghidra.program.flatapi import FlatProgramAPI
 from ghidra.program.model.symbol import SymbolType, SourceType
 from ghidra.program.model.listing import BookmarkType
@@ -12,23 +14,30 @@ from ghidra.app.services import ConsoleService, CodeViewerService
 from ghidra.util.task import TaskMonitor
 from ghidra.app.script import GhidraScriptUtil, GhidraState
 from ghidra.app.util.viewer.field import ListingColors
-from javax.swing import JFrame, JTextField, JList, JScrollPane, SwingUtilities, JPanel, DefaultListCellRenderer, SwingWorker, UIManager
-from javax.swing.event import DocumentListener
+from javax.swing import JFrame, JTextField, JList, JScrollPane, SwingUtilities, JPanel, DefaultListCellRenderer, UIManager
 from java.lang import Object, System
 from java.awt import BorderLayout, Color, Font, GraphicsEnvironment, Window
-from java.awt.event import KeyAdapter, KeyEvent, ComponentAdapter
+from java.awt.event import KeyEvent
 from java.util import Vector
 from java.awt import Toolkit
 from java.awt.datatransfer import StringSelection
-from __main__ import (
-    getBytes,
-    currentAddress,
-    getState,
-    getCurrentProgram,
-    toAddr,
-    goTo,
-    monitor,
-)
+from jpype import JProxy
+
+
+try:
+    long
+except NameError:
+    long = int
+
+
+def get_current_address():
+    try:
+        return currentAddress
+    except NameError:
+        codeViewerService = makeState().getTool().getService(CodeViewerService)
+        if codeViewerService and codeViewerService.getCurrentLocation():
+            return codeViewerService.getCurrentLocation().getAddress()
+        return getCurrentProgram().getImageBase()
 
 
 def matches(name, query):
@@ -100,24 +109,19 @@ def wrap_goto(addr):
     return lambda: goTo(addr)
 
 
-class ScriptExecutor(SwingWorker):
+class ScriptExecutor(object):
     def __init__(self, script):
-        super(ScriptExecutor, self).__init__()
         self.script = script
 
-    def doInBackground(self):
+    def execute(self):
         con = makeState().getTool().getService(ConsoleService)
         prov = GhidraScriptUtil.getProvider(self.script)
         inst = prov.getScriptInstance(self.script, con.getStdOut())
         inst.execute(makeState(), monitor, con.getStdOut())
 
-    def done(self):
-        pass
 
-
-class SymbolLoader(SwingWorker):
+class SymbolLoader(object):
     def __init__(self, parent):
-        super(SymbolLoader, self).__init__()
         self.parent = parent
 
     def get_everything(self):
@@ -129,9 +133,9 @@ class SymbolLoader(SwingWorker):
         everything += get_scripts()
         return everything
 
-    def doInBackground(self):
+    def execute(self):
         try:
-            return self.get_everything()
+            symbols = self.get_everything()
         except:
             # uncomment this for debug info:
             # import traceback
@@ -143,18 +147,16 @@ class SymbolLoader(SwingWorker):
             # We should probably watch when ghidra window exits and then cleanup, but...
             # Just kill ourselves and let user try again.
             self.parent.dispose()
-            return []  # Just so we don't raise an exception in a second
+            return
 
-    def done(self):
         def refresh_data():
             ndx = self.parent.symbolList.getSelectedIndex()
             self.parent.updateList(self.parent.inputField.getText())
             self.parent.symbolList.setSelectedIndex(ndx)
 
         try:
-            symbols = self.get()
             self.parent.symbols = symbols
-            SwingUtilities.invokeLater(refresh_data)
+            invoke_later(refresh_data)
         except Exception as e:
             print("Error loading symbols" + str(e))
 
@@ -189,15 +191,39 @@ def get_color(sym):
     }[kind]
 
 
-class SymbolFilterWindow(JFrame):
+def as_component_listener(listener):
+    return JProxy("java.awt.event.ComponentListener", inst=listener)
+
+
+def as_key_listener(listener):
+    return JProxy("java.awt.event.KeyListener", inst=listener)
+
+
+def as_document_listener(listener):
+    return JProxy("javax.swing.event.DocumentListener", inst=listener)
+
+
+def as_list_cell_renderer(renderer):
+    return JProxy("javax.swing.ListCellRenderer", inst=renderer)
+
+
+def invoke_later(func):
+    class _Runnable(object):
+        def run(self):
+            func()
+
+    SwingUtilities.invokeLater(JProxy("java.lang.Runnable", inst=_Runnable()))
+
+
+class SymbolFilterWindow(object):
     def __init__(self, title, symbols):
-        super(SymbolFilterWindow, self).__init__(title)
+        self.frame = JFrame(title)
         self.special_symbols = []
         self.symbols = symbols
         self.filtered_symbols = symbols
         self.initUI()
         self.selected_index = 0
-        self.initial_address = currentAddress
+        self.initial_address = get_current_address()
         # special_symbols are currently used in the "xref search mode" -
         # we are searching in them instead of self.symbols
         # Special search mode is enabled when self.special_symbols is not empty.
@@ -208,6 +234,9 @@ class SymbolFilterWindow(JFrame):
         # keep track of recently used symbols. We want to show recent symbols
         # at the top of the search list, so it's easy to repeat the search.
 
+    def __getattr__(self, attr):
+        return getattr(self.frame, attr)
+
     def initUI(self):
         self.setSize(1200, 600)
         self.setResizable(False)
@@ -215,7 +244,7 @@ class SymbolFilterWindow(JFrame):
         self.getContentPane().setLayout(BorderLayout())
 
         me = self
-        class MyComponentAdapter(ComponentAdapter):
+        class MyComponentListener(object):
             def componentShown(self, event):
                 codeViewerService = makeState().getTool().getService(CodeViewerService)
                 if codeViewerService:
@@ -234,11 +263,11 @@ class SymbolFilterWindow(JFrame):
             def componentMoved(self, event): pass
             def componentResized(self, event): pass
 
-        self.addComponentListener(MyComponentAdapter())
+        self.addComponentListener(as_component_listener(MyComponentListener()))
 
         inputPanel = JPanel(BorderLayout())
         self.inputField = JTextField()
-        self.inputField.addKeyListener(FilterKeyAdapter(self))
+        self.inputField.addKeyListener(as_key_listener(FilterKeyAdapter(self)))
 
         inputPanel.add(self.inputField, BorderLayout.CENTER)
 
@@ -252,12 +281,12 @@ class SymbolFilterWindow(JFrame):
 
         font = Font(fontname, Font.PLAIN, 14)
         self.inputField.setFont(font)
-        self.inputField.getDocument().addDocumentListener(MyDocumentListener(self))
+        self.inputField.getDocument().addDocumentListener(as_document_listener(MyDocumentListener(self)))
 
         self.symbolList = JList(Vector([]))
         self.updateList("")
-        self.symbolList.setCellRenderer(SymbolCellRenderer(self))
-        self.symbolList.addKeyListener(FilterKeyAdapter(self))
+        self.symbolList.setCellRenderer(as_list_cell_renderer(SymbolCellRenderer(self)))
+        self.symbolList.addKeyListener(as_key_listener(FilterKeyAdapter(self)))
         self.symbolList.setFont(font)
 
         self.scrollPane = JScrollPane(self.symbolList)
@@ -328,18 +357,21 @@ class SymbolFilterWindow(JFrame):
                 off = toAddr(result).subtract(func.getEntryPoint())
                 strings.append("sym " + func.getName() + ("+{:x}".format(off) if off else ""))
         elif isinstance(result, str):
+            result_bytes = result.encode("utf-8")
             strings = [
                 "str " + result,
-                "hex " + result.encode("hex"),  # type: ignore (py2)
-                "base64 " + result.encode("base64"),  # type: ignore (py2)
+                "hex " + binascii.hexlify(result_bytes).decode("ascii"),
+                "base64 " + base64.b64encode(result_bytes).decode("ascii"),
             ]
             try:
-                strings.append("unhex " + result.replace(" ", "").decode("hex"))  # type: ignore (py2)
-            except TypeError:
+                unhex = binascii.unhexlify(result.replace(" ", ""))
+                strings.append("unhex " + unhex.decode("utf-8", "replace"))
+            except (TypeError, ValueError, binascii.Error):
                 pass
             try:
-                strings.append("unbase64 " + result.decode("base64"))  # type: ignore (py2)
-            except:  # binascii.error
+                unbase64 = base64.b64decode(result)
+                strings.append("unbase64 " + unbase64.decode("utf-8", "replace"))
+            except Exception:
                 pass
         elif isinstance(result, list):
             strings = [str(r) for r in result]
@@ -378,8 +410,9 @@ class SymbolFilterWindow(JFrame):
             filtered_symbols = self.quick_exec(filter_text[1:])
         elif filter_text and filter_text[0] == "{":
             try:
-                needle = filter_text[1:].replace(" ", "").decode("hex")
-            except:
+                raw = binascii.unhexlify(filter_text[1:].replace(" ", ""))
+                needle = raw.decode("latin1")
+            except Exception:
                 needle = ""
             filtered_symbols = self.entries_by_search(needle, False)
         else:
@@ -502,7 +535,7 @@ class SymbolFilterWindow(JFrame):
         goTo(self.initial_address)
 
 
-class MyDocumentListener(DocumentListener):
+class MyDocumentListener(object):
     def __init__(self, parent):
         self.parent = parent
 
@@ -513,9 +546,15 @@ class MyDocumentListener(DocumentListener):
         self.parent.updateList(self.parent.inputField.getText())
 
 
-class FilterKeyAdapter(KeyAdapter):
+class FilterKeyAdapter(object):
     def __init__(self, parent):
         self.parent = parent
+
+    def keyTyped(self, event):
+        pass
+
+    def keyReleased(self, event):
+        pass
 
     def navigate(self, diff):
         symlist = self.parent.symbolList
@@ -569,16 +608,18 @@ class FilterKeyAdapter(KeyAdapter):
             System.gc()
 
 
-class SymbolCellRenderer(DefaultListCellRenderer):
+class SymbolCellRenderer(object):
     def __init__(self, parent):
         self.window = parent
+        self.default_renderer = DefaultListCellRenderer()
 
     def getListCellRendererComponent(self, list, value, index, isSelected, cellHasFocus):
-        component = super(SymbolCellRenderer, self).getListCellRendererComponent(
+        component = self.default_renderer.getListCellRendererComponent(
             list, value, index, isSelected, cellHasFocus)
 
-        symbol = self.window.filtered_symbols[index]
-        component.setForeground(symbol.color)
+        if 0 <= index < len(self.window.filtered_symbols):
+            symbol = self.window.filtered_symbols[index]
+            component.setForeground(symbol.color)
 
         return component
 
@@ -707,7 +748,7 @@ def get_actions():
     symbols = []
     context = prov.getActionContext(None)
     for act in makeState().getTool().getAllActions():
-        if not issubclass(type(context), act.getContextClass()):
+        if not act.getContextClass().isAssignableFrom(context.getClass()):
             continue
 
         try:
@@ -777,7 +818,7 @@ WINDOW_NAME = "CtrlP - " + str(getCurrentProgram().getDomainFile())
 
 def run():
     symbols = []
-    SwingUtilities.invokeLater(lambda: SymbolFilterWindow(WINDOW_NAME, symbols).setVisible(True))
+    invoke_later(lambda: SymbolFilterWindow(WINDOW_NAME, symbols).setVisible(True))
 
 
 def run_or_restore():
