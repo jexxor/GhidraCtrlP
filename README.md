@@ -1,6 +1,6 @@
 # Ghidra CtrlP Script
 
-> This fork provides plugin support for latest Ghidra API (Ghidra 12.0.4 at the moment, PyGhidra support required)
+> This fork provides plugin support for latest Ghidra API and caching (this is helpful for large programs, as it significantly reduces the time needed to open the plugin and start searching).
 
 Ghidra is great, but very mouse-driven by default. Some modern editors (like VS Code) provide a quick file switcher/command
 pallete, commonly bound to Ctrl+P file switcher and command pallete. I decided,
@@ -85,7 +85,7 @@ Warning: it's **not** optimized: it will rescan whole program memory for every c
 
 **Other notes**
 
-The plugin tries to use `"FiraCode Nerd Font Mono"` font, and if that fails it falls back to `"Monospaced"`.
+The plugin tries to use `"CaskaydiaMono Nerd Font"` font, and if that fails it falls back to `"Monospaced"`.
 In the future maybe I'll try to get the default font for listing for example.
 
 There is a support for dark theme (the colors adjust themselves).

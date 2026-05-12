@@ -29,6 +29,53 @@ try:
 except NameError:
     long = int
 
+_SYMBOL_CACHE = {}
+_SYMBOL_CACHE_ORDER = []
+_SYMBOL_CACHE_LIMIT = 3
+
+
+def _program_cache_key(program):
+    try:
+        ident = System.identityHashCode(program)
+    except Exception:
+        try:
+            ident = id(program)
+        except Exception:
+            ident = 0
+    path = "unknown"
+    try:
+        domain = program.getDomainFile()
+        if domain:
+            try:
+                path = domain.getPathname()
+            except Exception:
+                path = str(domain)
+    except Exception:
+        try:
+            path = str(program)
+        except Exception:
+            pass
+    return (path, ident)
+
+
+def _program_mod_number(program):
+    try:
+        return program.getModificationNumber()
+    except Exception:
+        return None
+
+
+def _touch_symbol_cache(cache_key):
+    try:
+        _SYMBOL_CACHE_ORDER.remove(cache_key)
+    except ValueError:
+        pass
+    _SYMBOL_CACHE_ORDER.append(cache_key)
+    if len(_SYMBOL_CACHE_ORDER) > _SYMBOL_CACHE_LIMIT:
+        old_key = _SYMBOL_CACHE_ORDER.pop(0)
+        if old_key in _SYMBOL_CACHE:
+            del _SYMBOL_CACHE[old_key]
+
 
 def get_current_address():
     try:
@@ -233,6 +280,13 @@ class SymbolFilterWindow(object):
         self.recent_symbols = {}
         # keep track of recently used symbols. We want to show recent symbols
         # at the top of the search list, so it's easy to repeat the search.
+        self.search_cache = {}
+        self.search_cache_meta = {}
+        self.search_cache_order = []
+        self.search_cache_limit = 40
+        self.last_search = None
+        self.last_search_results = None
+        self.last_search_truncated = False
 
     def __getattr__(self, attr):
         return getattr(self.frame, attr)
@@ -272,7 +326,7 @@ class SymbolFilterWindow(object):
         inputPanel.add(self.inputField, BorderLayout.CENTER)
 
         fontname = None
-        FONTS = ["FiraCode Nerd Font Mono", "Monospaced"]
+        FONTS = ["CaskaydiaMono Nerd Font", "Monospaced"]
         for fontname in FONTS:
             g = GraphicsEnvironment.getLocalGraphicsEnvironment()
             if fontname in g.getAvailableFontFamilyNames():
@@ -301,21 +355,89 @@ class SymbolFilterWindow(object):
 
         self.inputField.requestFocusInWindow()
 
-    def entries_by_search(self, needle, ignore_case):
-        if not needle:
-            return [SearchEntry(
-                "dat (entering search mode)",
-                None,
-                lambda: None
-            )]
+    def _remember_search(self, cache_key, results, truncated):
+        self.search_cache[cache_key] = results
+        self.search_cache_meta[cache_key] = truncated
+        try:
+            self.search_cache_order.remove(cache_key)
+        except ValueError:
+            pass
+        self.search_cache_order.append(cache_key)
+        if len(self.search_cache_order) > self.search_cache_limit:
+            old_key = self.search_cache_order.pop(0)
+            if old_key in self.search_cache:
+                del self.search_cache[old_key]
+            if old_key in self.search_cache_meta:
+                del self.search_cache_meta[old_key]
 
+    def _byte_value(self, value):
+        if isinstance(value, (int, long)):
+            return value & 0xFF
+        return ord(value) & 0xFF
+
+    def _encode_search_bytes(self, text):
+        try:
+            raw = text.encode("latin1")
+        except Exception:
+            return None
+        if isinstance(raw, str):
+            return [ord(c) for c in raw]
+        return list(raw)
+
+    def _bytes_match(self, data, needle_bytes, ignore_case):
+        if data is None or len(data) < len(needle_bytes):
+            return False
+        for i in range(len(needle_bytes)):
+            data_b = self._byte_value(data[i])
+            needle_b = needle_bytes[i]
+            if ignore_case:
+                if chr(data_b).lower() != chr(needle_b).lower():
+                    return False
+            else:
+                if data_b != needle_b:
+                    return False
+        return True
+
+    def _filter_search_results(self, entries, prev_needle, new_needle, ignore_case):
+        if entries is None:
+            return None
+        if not new_needle.startswith(prev_needle) or len(new_needle) <= len(prev_needle):
+            return None
+
+        suffix = new_needle[len(prev_needle):]
+        suffix_bytes = self._encode_search_bytes(suffix)
+        if suffix_bytes is None:
+            return None
+        if not suffix_bytes:
+            return entries
+
+        prev_len = len(prev_needle)
+        suffix_len = len(suffix_bytes)
+        filtered = []
+        for entry in entries:
+            addr = entry.address
+            if addr is None:
+                continue
+            try:
+                data = getBytes(addr.add(prev_len), suffix_len)
+            except Exception:
+                data = None
+            if self._bytes_match(data, suffix_bytes, ignore_case):
+                filtered.append(entry)
+        return filtered
+
+    def _run_memory_search(self, needle, ignore_case):
         pattern = re.escape(needle)
         if ignore_case:
             pattern = "(?i)" + pattern
 
-        filtered_symbols = []
         flatapi = FlatProgramAPI(getCurrentProgram())
-        occurs = list(flatapi.findBytes(getCurrentProgram().getMinAddress(), pattern, 100))
+        occurs = list(flatapi.findBytes(getCurrentProgram().getMinAddress(), pattern, 101))
+
+        truncated = False
+        if len(occurs) > 100:
+            occurs = occurs[:100]
+            truncated = True
 
         mem = getCurrentProgram().getMemory()
 
@@ -327,11 +449,53 @@ class SymbolFilterWindow(object):
                 start = rng.getMinAddress()
 
             context = getBytes(start, 130)
+            if context is None:
+                context = []
+            context_text = "".join(
+                chr(self._byte_value(b)) if 32 <= self._byte_value(b) < 127 else "."
+                for b in context
+            )
             filtered_symbols.append(SearchEntry(
-                "dat " + str(addr) + " " + "".join(chr(b % 256) if 32 <= b < 127 else '.' for b in context),
+                "dat " + str(addr) + " " + context_text,
                 addr,
                 wrap_goto(addr)
             ))
+        return filtered_symbols, truncated
+
+    def entries_by_search(self, needle, ignore_case):
+        if not needle:
+            return [SearchEntry(
+                "dat (entering search mode)",
+                None,
+                lambda: None
+            )]
+
+        cache_key = (needle, ignore_case)
+        cached = self.search_cache.get(cache_key)
+        if cached is not None:
+            self.last_search = cache_key
+            self.last_search_results = cached
+            self.last_search_truncated = self.search_cache_meta.get(cache_key, False)
+            return cached
+
+        if self.last_search and self.last_search[1] == ignore_case and not self.last_search_truncated:
+            prev_needle = self.last_search[0]
+            if prev_needle and needle.startswith(prev_needle):
+                filtered = self._filter_search_results(
+                    self.last_search_results, prev_needle, needle, ignore_case
+                )
+                if filtered is not None:
+                    self._remember_search(cache_key, filtered, False)
+                    self.last_search = cache_key
+                    self.last_search_results = filtered
+                    self.last_search_truncated = False
+                    return filtered
+
+        filtered_symbols, truncated = self._run_memory_search(needle, ignore_case)
+        self._remember_search(cache_key, filtered_symbols, truncated)
+        self.last_search = cache_key
+        self.last_search_results = filtered_symbols
+        self.last_search_truncated = truncated
         return filtered_symbols
 
     def quick_exec(self, command):
@@ -432,6 +596,9 @@ class SymbolFilterWindow(object):
                     None,
                     lambda: None
                 ))
+
+        for sym in filtered_symbols:
+            sym.has_bookmark_cache = None
 
         self.filtered_symbols = filtered_symbols
         self.symbolList.setListData(Vector([sym.text for sym in filtered_symbols]))
@@ -767,9 +934,19 @@ def get_actions():
 
 
 def get_symbols():
+    program = getCurrentProgram()
+    mod_number = _program_mod_number(program)
+    cache_key = None
+    if mod_number is not None:
+        cache_key = _program_cache_key(program)
+        cached = _SYMBOL_CACHE.get(cache_key)
+        if cached and cached.get("mod") == mod_number:
+            _touch_symbol_cache(cache_key)
+            return cached.get("symbols", [])
+
     symbols = []
-    symbolTable = getCurrentProgram().getSymbolTable()
-    mem = getCurrentProgram().getMemory()
+    symbolTable = program.getSymbolTable()
+    mem = program.getMemory()
     for symbol in symbolTable.getAllSymbols(True):
         if not mem.contains(symbol.getAddress()):
             continue
@@ -784,6 +961,9 @@ def get_symbols():
         else:
             symbols.append(data_symbol_entry(symbol))
 
+    if mod_number is not None and cache_key is not None:
+        _SYMBOL_CACHE[cache_key] = {"mod": mod_number, "symbols": symbols}
+        _touch_symbol_cache(cache_key)
     return symbols
 
 
