@@ -15,7 +15,7 @@ from ghidra.util.task import TaskMonitor
 from ghidra.app.script import GhidraScriptUtil, GhidraState
 from ghidra.app.util.viewer.field import ListingColors
 from javax.swing import JFrame, JTextField, JList, JScrollPane, SwingUtilities, JPanel, DefaultListCellRenderer, UIManager
-from java.lang import Object, System
+from java.lang import Object, System, Thread
 from java.awt import BorderLayout, Color, Font, GraphicsEnvironment, Window
 from java.awt.event import KeyEvent
 from java.util import Vector
@@ -193,7 +193,7 @@ class SymbolLoader(object):
             # and this thread/wtf is in a broken state.
             # We should probably watch when ghidra window exits and then cleanup, but...
             # Just kill ourselves and let user try again.
-            self.parent.dispose()
+            invoke_later(lambda: self.parent.dispose())
             return
 
         def refresh_data():
@@ -206,6 +206,19 @@ class SymbolLoader(object):
             invoke_later(refresh_data)
         except Exception as e:
             print("Error loading symbols" + str(e))
+
+
+def run_in_background(func, name=None):
+    class _Runnable(object):
+        def run(self):
+            func()
+
+    runnable = JProxy("java.lang.Runnable", inst=_Runnable())
+    thread = Thread(runnable)
+    if name:
+        thread.setName(name)
+    thread.setDaemon(True)
+    thread.start()
 
 
 def prettyPrintAddress(source):
@@ -287,6 +300,8 @@ class SymbolFilterWindow(object):
         self.last_search = None
         self.last_search_results = None
         self.last_search_truncated = False
+        self.symbol_load_in_progress = False
+        self.symbol_load_pending = False
 
     def __getattr__(self, attr):
         return getattr(self.frame, attr)
@@ -311,7 +326,7 @@ class SymbolFilterWindow(object):
                 if me.symbols:
                     me.symbolList.setSelectedIndex(0)
                     me.symbolList.ensureIndexIsVisible(me.symbolList.getSelectedIndex())
-                SymbolLoader(me).execute()  # start updating symbols in the background
+                me.request_symbol_refresh()  # refresh symbols without blocking restore
 
             def componentHidden(self, event): pass
             def componentMoved(self, event): pass
@@ -326,7 +341,7 @@ class SymbolFilterWindow(object):
         inputPanel.add(self.inputField, BorderLayout.CENTER)
 
         fontname = None
-        FONTS = ["CaskaydiaMono Nerd Font", "Monospaced"]
+        FONTS = ["CaskaydiaMono NFM", "Monospaced"]
         for fontname in FONTS:
             g = GraphicsEnvironment.getLocalGraphicsEnvironment()
             if fontname in g.getAvailableFontFamilyNames():
@@ -354,6 +369,27 @@ class SymbolFilterWindow(object):
         self.symbolList.setFocusable(False)
 
         self.inputField.requestFocusInWindow()
+
+    def request_symbol_refresh(self):
+        if self.symbol_load_in_progress:
+            self.symbol_load_pending = True
+            return
+
+        self.symbol_load_in_progress = True
+        self.symbol_load_pending = False
+
+        def _load():
+            try:
+                SymbolLoader(self).execute()
+            finally:
+                def _finish():
+                    self.symbol_load_in_progress = False
+                    if self.symbol_load_pending:
+                        self.request_symbol_refresh()
+
+                invoke_later(_finish)
+
+        run_in_background(_load, "ctrlp-symbol-loader")
 
     def _remember_search(self, cache_key, results, truncated):
         self.search_cache[cache_key] = results
